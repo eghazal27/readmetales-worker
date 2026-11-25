@@ -1,0 +1,117 @@
+name: process-book
+
+# ReadMeTales worker. Started by the app (POST /api/books/<id>/jobs) to sync an ebook or build a drama transcript.
+# This public repo holds only this file; the code lives in the private app repo, checked out read-only.
+# Secrets: APP_REPO_TOKEN (fine-grained token, Contents: read on the app repo),
+#          READMETALES_TOKEN (admin API token from ReadMeTales Settings).
+on:
+  workflow_dispatch:
+    inputs:
+      job_id: { description: ReadMeTales job id, required: true }
+      book_id: { description: Book id, required: true }
+      kind: { description: align, drama or check, required: true }
+      ebook_id: { description: Ebook edition (align) or novel used for character names (drama), required: false, default: '' }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: process-book-${{ inputs.book_id }}
+  cancel-in-progress: false
+
+env:
+  WHISPER_TAG: b5907
+  READMETALES_SERVER: https://readmetales.vercel.app
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: eghazal27/readmetales
+          ref: main
+          token: ${{ secrets.APP_REPO_TOKEN }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+
+      - name: ffmpeg
+        if: inputs.kind != 'check'
+        run: command -v ffmpeg || (sudo apt-get update -q && sudo apt-get install -yq ffmpeg)
+
+      - name: Cache whisper.cpp
+        if: inputs.kind != 'check'
+        id: whisper
+        uses: actions/cache@v4
+        with:
+          path: ~/whisper-bin
+          key: whisper-${{ env.WHISPER_TAG }}-${{ runner.os }}
+      - name: Build whisper.cpp
+        if: inputs.kind != 'check' && steps.whisper.outputs.cache-hit != 'true'
+        run: |
+          git clone -q --depth 1 --branch "$WHISPER_TAG" https://github.com/ggml-org/whisper.cpp /tmp/whisper.cpp
+          cmake -S /tmp/whisper.cpp -B /tmp/whisper.cpp/build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          cmake --build /tmp/whisper.cpp/build -j"$(nproc)" --target whisper-cli
+          mkdir -p ~/whisper-bin && cp /tmp/whisper.cpp/build/bin/whisper-cli ~/whisper-bin/
+
+      - name: Cache speech models
+        if: inputs.kind != 'check'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/readmetales/align/models
+          key: whisper-models-v1
+
+      - name: Python for voice recognition
+        if: inputs.kind == 'drama'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: tools/drama/requirements.txt
+      - name: Cache voice models
+        if: inputs.kind == 'drama'
+        uses: actions/cache@v4
+        with:
+          path: ~/drama-models
+          key: drama-models-v1
+      - name: Voice recognition packages and models
+        if: inputs.kind == 'drama'
+        run: |
+          python -m venv ~/drama-venv
+          ~/drama-venv/bin/pip install -q -r tools/drama/requirements.txt
+          mkdir -p ~/drama-models && cd ~/drama-models
+          R=https://github.com/k2-fsa/sherpa-onnx/releases/download
+          [ -f sherpa-onnx-pyannote-segmentation-3-0/model.onnx ] || curl -sSfL "$R/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2" | tar xj
+          [ -f 3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx ] || curl -sSfLO "$R/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx"
+      - name: Browser for ebook processing
+        if: inputs.kind == 'drama'
+        run: npm install -g playwright@1.49.1 && npx -y playwright@1.49.1 install --with-deps chromium
+
+      - name: Run
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+          BOOK_ID: ${{ inputs.book_id }}
+          KIND: ${{ inputs.kind }}
+          EBOOK_ID: ${{ inputs.ebook_id }}
+          READMETALES_TOKEN: ${{ secrets.READMETALES_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WHISPER_CLI: /home/runner/whisper-bin/whisper-cli
+          DRAMA_PY: /home/runner/drama-venv/bin/python
+          DRAMA_MODELS: /home/runner/drama-models
+          THREADS: 4
+        run: NODE_PATH="$(npm root -g)" npx tsx tools/jobs/run.ts
+
+      - name: Report a crash or timeout
+        if: failure() || cancelled()
+        env:
+          READMETALES_TOKEN: ${{ secrets.READMETALES_TOKEN }}
+        run: |
+          curl -sS -X PATCH "$READMETALES_SERVER/api/jobs/${{ inputs.job_id }}" \
+            -H "authorization: Bearer $READMETALES_TOKEN" -H 'content-type: application/json' \
+            --data '{"status":"failed","stage":"Failed","error":"The GitHub job stopped (crash, timeout or cancelled). See Details.","runUrl":"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}' || true
